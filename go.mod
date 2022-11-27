@@ -1,3 +1,3 @@
-module github.com/AbhinavAchha/sync_repo
+module github.com/AbhinavAchha/syncrepo
 
 go 1.19
