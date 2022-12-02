@@ -10,4 +10,8 @@ go install github.com/AbhinavAchha/syncrepo@latest
 
 ## Usage
 
-`syncrepo path/to/the/directory`
+### Pull All Repositories in given Path
+`syncrepo --path path/to/the/directory`
+
+### Get List of Repositories and Save it to given File
+`syncrepo --list path --file repolist.txt`
