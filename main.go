@@ -13,45 +13,58 @@ import (
 	"sync"
 )
 
+var flags struct {
+	path     string
+	fileName string
+	pull     bool
+	list     bool
+	help     bool
+	export   bool
+}
+
 func main() {
-	helpArg := flag.Bool("help", false, "Show help")
-	pathArg := flag.String(
-		"path",
-		".",
-		"Path to the directory containing the git repositories.\nDefault is the current directory",
-	)
-	fileNameArg := flag.String("file", "", "File name to save the list of git repositories")
-	pullArg := flag.Bool("pull", false, "Pull all the git repositories in the path")
-	listArg := flag.Bool("list", false, "List all the git repositories in the path")
+	flag.StringVar(&flags.path, "path", ".", "Path to the directory containing git repositories")
+	flag.StringVar(&flags.fileName, "file", "", "File name to save the list of git repositories")
+	flag.BoolVar(&flags.pull, "pull", false, "Pull all the git repositories")
+	flag.BoolVar(&flags.list, "list", false, "List all the git repositories")
+	flag.BoolVar(&flags.help, "help", false, "Show help")
+	flag.BoolVar(&flags.export, "export", false, "Export all the git repositories to a JSON file")
 	flag.Parse()
 
-	if *helpArg {
+	// check if no arguments are specified
+	if !flags.pull && !flags.list && !flags.help && !flags.export {
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
 
-	path := parsePath(*pathArg)
+	path := parsePath(flags.path)
 	list := getDirectories(path)
-	if *listArg {
+	if flags.list {
 		urls := getGitRepos(list)
-		if *fileNameArg != "" {
-			saveToFile(*fileNameArg, urls)
+		if flags.fileName != "" {
+			saveToFile(flags.fileName, urls)
 		} else {
 			printList(urls)
 		}
 	}
 
-	if *pullArg {
+	if flags.pull {
 		pullGitRepos(list)
+	}
+
+	if flags.export {
+		repoData := getExportData(list)
+		exportJSON(repoData)
 	}
 }
 
 // getDirectories function uses the 'path' argument to get all the directories in the path.
 // It returns a list of directories as a string slice
 func getDirectories(path string) []string {
-	output, err := exec.Command("find", path, "-name", ".git").Output()
+	output, err := exec.Command("find", path, "-type", "d", "-name", ".git", "-not", "-path", "*/.git/modules/*").
+		Output()
 	if err != nil {
-		panic(err)
+		log.Default().Print(err)
 	}
 	return strings.Split(string(output), "\n")
 }
@@ -65,7 +78,7 @@ func getGitRepos(list []string) (urls []string) {
 		go func(dir string) {
 			defer wg.Done()
 			dir = strings.TrimSuffix(dir, "/.git")
-			cmd, err := exec.Command("git", "-C", dir, "remote", "get-url", "--push", "origin").Output()
+			cmd, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 			if err != nil {
 				log.Default().Print(err)
 				return
@@ -106,14 +119,17 @@ func runCommand(dir string) error {
 func parsePath(path string) string {
 	if path == "." {
 		path, _ = os.Getwd()
-	} else if strings.HasPrefix(path, "~") {
-		home, _ := os.UserHomeDir()
-		path = strings.Replace(path, "~", home, 1)
+		return path
 	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		log.Default().Print("Path does not exist")
-		log.Default().Print("Please enter a valid path")
-		os.Exit(1)
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		path = strings.Replace(path, "~/", home, 1)
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			log.Fatal("Path does not exists. Please specify a valid path")
+		}
+		log.Fatal(err)
 	}
 	return path
 }
