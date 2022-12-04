@@ -20,6 +20,7 @@ var flags struct {
 	list     bool
 	help     bool
 	export   bool
+	toImport bool
 }
 
 func main() {
@@ -29,12 +30,13 @@ func main() {
 	flag.BoolVar(&flags.list, "list", false, "List all the git repositories")
 	flag.BoolVar(&flags.help, "help", false, "Show help")
 	flag.BoolVar(&flags.export, "export", false, "Export all the git repositories to a JSON file")
+	flag.BoolVar(&flags.toImport, "import", false, "Import all the git repositories from a JSON file")
 	flag.Parse()
 
 	// check if no arguments are specified
-	if !flags.pull && !flags.list && !flags.help && !flags.export {
-		flag.PrintDefaults()
-		os.Exit(0)
+	if flags.help || len(os.Args) == 1 {
+		flag.Usage()
+		return
 	}
 
 	path := parsePath(flags.path)
@@ -55,6 +57,11 @@ func main() {
 	if flags.export {
 		repoData := getExportData(list)
 		exportJSON(repoData)
+	}
+
+	if flags.toImport {
+		jsonData := importJSON(flags.fileName)
+		createRepos(jsonData)
 	}
 }
 
