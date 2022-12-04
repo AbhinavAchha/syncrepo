@@ -20,6 +20,9 @@ func getExportData(dirs []string) (jsonData map[string]string) {
 	for _, dir := range dirs {
 		go func(dir string) {
 			defer wg.Done()
+			if dir == "" {
+				return
+			}
 			data := getGitRepo(dir)
 			dir = strings.TrimPrefix(strings.TrimSuffix(dir, "/.git"), prefix)
 
@@ -56,7 +59,7 @@ func exportJSON(data map[string]string) {
 	}
 	fileName := flags.fileName
 	if fileName == "" {
-		fileName = "export"
+		fileName = "export.json"
 	} else if !strings.HasSuffix(fileName, ".json") {
 		fileName += ".json"
 	}
