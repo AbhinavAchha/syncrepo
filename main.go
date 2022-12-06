@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -158,5 +159,107 @@ func saveToFile(fileName string, list []string) {
 	defer file.Close()
 	for _, url := range list {
 		file.WriteString(url)
+	}
+}
+
+// getExportData function gets the data to export to JSON
+func getExportData(dirs []string) (jsonData map[string]string) {
+	jsonData = make(map[string]string, len(dirs))
+	wg := sync.WaitGroup{}
+	wg.Add(len(dirs))
+	mtx := sync.Mutex{}
+	prefix := parsePath(flags.path) + "/"
+
+	for _, dir := range dirs {
+		go func(dir string) {
+			defer wg.Done()
+			if dir == "" {
+				return
+			}
+			data := getGitRepo(dir)
+			dir = strings.TrimPrefix(strings.TrimSuffix(dir, "/.git"), prefix)
+
+			mtx.Lock()
+			jsonData[dir] = data
+			mtx.Unlock()
+		}(dir)
+	}
+	wg.Wait()
+	return jsonData
+}
+
+// // getGitRepo function gets the git repository from the directory
+func getGitRepo(dir string) string {
+	output, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// saveFile function saves the data to a file
+func saveFile(filename string, data []byte) {
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// exportJSON function exports the data to a JSON file
+func exportJSON(data map[string]string) {
+	result, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fileName := flags.fileName
+	if fileName == "" {
+		fileName = "export.json"
+	} else if !strings.HasSuffix(fileName, ".json") {
+		fileName += ".json"
+	}
+	saveFile(fileName, result)
+}
+
+// importJSON function imports the data from a JSON file
+func importJSON(filename string) (jsonData map[string]string) {
+	if filename == "" {
+		log.Default().Println("No filename specified, using 'export.json'")
+		filename = "export.json"
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		log.Fatal("Error reading file: ", err)
+	}
+	if err = json.Unmarshal(data, &jsonData); err != nil {
+		log.Fatal(err)
+	}
+	return jsonData
+}
+
+// createRepos function creates the git repositories
+func createRepos(data map[string]string) {
+	wg := sync.WaitGroup{}
+	wg.Add(len(data))
+	importPath := parsePath(flags.path)
+	for dir, url := range data {
+		go func(dir, url string) {
+			defer wg.Done()
+
+			if err := os.MkdirAll(importPath+"/"+dir, 0755); err != nil {
+				log.Fatal(err)
+			}
+			clone(dir, url)
+		}(dir, url)
+
+	}
+	wg.Wait()
+}
+
+// clone function clones the git repository
+func clone(dir, url string) {
+	cmd := exec.Command("git", "clone", url, dir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatal(err)
 	}
 }
