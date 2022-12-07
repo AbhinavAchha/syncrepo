@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -72,7 +73,7 @@ func getDirectories(path string) []string {
 	output, err := exec.Command("find", path, "-type", "d", "-name", ".git", "-not", "-path", "*/.git/modules/*").
 		Output()
 	if err != nil {
-		log.Default().Print(err)
+		log.Printf("Error in getting directories: %s", err)
 	}
 	return strings.Split(string(output), "\n")
 }
@@ -88,7 +89,7 @@ func getGitRepos(list []string) (urls []string) {
 			dir = strings.TrimSuffix(dir, "/.git")
 			cmd, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 			if err != nil {
-				log.Default().Print(err)
+				log.Printf("Error in getting git repo url %s, %s", dir, err)
 				return
 			}
 			urls = append(urls, string(cmd))
@@ -137,7 +138,7 @@ func parsePath(path string) string {
 		if os.IsNotExist(err) {
 			log.Fatal("Path does not exists. Please specify a valid path")
 		}
-		log.Fatal(err)
+		log.Fatalf("Error in getting path: %s", err)
 	}
 	return path
 }
@@ -145,7 +146,7 @@ func parsePath(path string) string {
 // printList function prints the list of git repositories. It is used when the user does not specify a file name.
 func printList(list []string) {
 	for _, url := range list {
-		log.Default().Print(url)
+		fmt.Println(url)
 	}
 }
 
@@ -153,8 +154,7 @@ func printList(list []string) {
 func saveToFile(fileName string, list []string) {
 	file, err := os.Create(fileName)
 	if err != nil {
-		log.Default().Print(err)
-		return
+		log.Fatalf("Error in creating file: %s", err)
 	}
 	defer file.Close()
 	for _, url := range list {
@@ -192,7 +192,7 @@ func getExportData(dirs []string) (jsonData map[string]string) {
 func getGitRepo(dir string) string {
 	output, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error getting git repo from %s: %s", dir, err)
 	}
 	return strings.TrimSpace(string(output))
 }
@@ -200,7 +200,7 @@ func getGitRepo(dir string) string {
 // saveFile function saves the data to a file
 func saveFile(filename string, data []byte) {
 	if err := os.WriteFile(filename, data, 0644); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error saving file: %s, %s", filename, err)
 	}
 }
 
@@ -208,7 +208,7 @@ func saveFile(filename string, data []byte) {
 func exportJSON(data map[string]string) {
 	result, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error marshalling JSON: %s", err)
 	}
 	fileName := flags.fileName
 	if fileName == "" {
@@ -227,10 +227,10 @@ func importJSON(filename string) (jsonData map[string]string) {
 	}
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatal("Error reading file: ", err)
+		log.Fatalf("Error reading file: %s, %s", filename, err)
 	}
 	if err = json.Unmarshal(data, &jsonData); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error unmarshalling JSON: %s", err)
 	}
 	return jsonData
 }
@@ -245,7 +245,7 @@ func createRepos(data map[string]string) {
 			defer wg.Done()
 
 			if err := os.MkdirAll(importPath+"/"+dir, 0755); err != nil {
-				log.Fatal(err)
+				log.Fatalf("Error creating directory: %s, %s", dir, err)
 			}
 			clone(dir, url)
 		}(dir, url)
@@ -260,6 +260,6 @@ func clone(dir, url string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error cloning git repo: %s, %s", url, err)
 	}
 }
