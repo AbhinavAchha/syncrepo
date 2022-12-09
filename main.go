@@ -38,7 +38,7 @@ func main() {
 	// check if no arguments are specified
 	if flags.help || len(os.Args) == 1 {
 		flag.Usage()
-		return
+		os.Exit(0)
 	}
 
 	path := parsePath(flags.path)
@@ -59,11 +59,13 @@ func main() {
 	if flags.export {
 		repoData := getExportData(list)
 		exportJSON(repoData)
+		os.Exit(0)
 	}
 
 	if flags.toImport {
 		jsonData := importJSON(flags.fileName)
 		createRepos(jsonData)
+		os.Exit(0)
 	}
 }
 
