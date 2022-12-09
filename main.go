@@ -11,8 +11,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 var flags struct {
@@ -54,6 +56,7 @@ func main() {
 
 	if flags.pull {
 		pullGitRepos(list)
+		os.Exit(0)
 	}
 
 	if flags.export {
@@ -105,11 +108,13 @@ func getGitRepos(list []string) (urls []string) {
 func pullGitRepos(list []string) {
 	wg := sync.WaitGroup{}
 	wg.Add(len(list))
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	for _, dir := range list {
 		go func(dir string) {
 			defer wg.Done()
-			if err := runCommand(dir); err != nil {
-				log.Default().Print(err)
+			if err := runCommand(dir, c); err != nil {
+				log.Print(err)
 			}
 		}(dir)
 	}
@@ -117,12 +122,21 @@ func pullGitRepos(list []string) {
 }
 
 // runCommand function runs the 'git -C pull --all' command in the directory specified by the 'dir' argument
-func runCommand(dir string) error {
+func runCommand(dir string, c chan os.Signal) (err error) {
 	dir = strings.TrimSuffix(dir, "/.git")
 	cmd := exec.Command("git", "-C", dir, "pull", "--all")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("Error starting pulling process %s, %s", dir, err)
+	}
+	select {
+	case <-c:
+		log.Fatal(cmd.Process.Kill())
+	default:
+		err = cmd.Wait()
+	}
+	return err
 }
 
 // parsePath function parses the path argument and returns the path as a string
@@ -224,7 +238,7 @@ func exportJSON(data map[string]string) {
 // importJSON function imports the data from a JSON file
 func importJSON(filename string) (jsonData map[string]string) {
 	if filename == "" {
-		log.Default().Println("No filename specified, using 'export.json'")
+		log.Println("No filename specified, using 'export.json'")
 		filename = "export.json"
 	}
 	data, err := os.ReadFile(filename)
@@ -241,15 +255,18 @@ func importJSON(filename string) (jsonData map[string]string) {
 func createRepos(data map[string]string) {
 	wg := sync.WaitGroup{}
 	wg.Add(len(data))
-	importPath := parsePath(flags.path)
+	importPath := parsePath(flags.path) + "/"
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
 	for dir, url := range data {
 		go func(dir, url string) {
 			defer wg.Done()
-
-			if err := os.MkdirAll(importPath+"/"+dir, 0755); err != nil {
+			dir = importPath + dir
+			if err := os.MkdirAll(dir, 0755); err != nil {
 				log.Fatalf("Error creating directory: %s, %s", dir, err)
 			}
-			clone(dir, url)
+			clone(dir, url, c)
 		}(dir, url)
 
 	}
@@ -257,11 +274,17 @@ func createRepos(data map[string]string) {
 }
 
 // clone function clones the git repository
-func clone(dir, url string) {
+func clone(dir, url string, c chan os.Signal) {
 	cmd := exec.Command("git", "clone", url, dir)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("Error cloning git repo: %s, %s", url, err)
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("Error starting clone process %s, %s", url, err)
+	}
+	select {
+	case <-c:
+		log.Fatal(cmd.Process.Kill())
+	default:
+		cmd.Wait()
 	}
 }
