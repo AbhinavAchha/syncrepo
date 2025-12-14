@@ -8,10 +8,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,7 +48,11 @@ func main() {
 	}
 
 	path := parsePath(flags.path)
-	list := getDirectories(path)
+	list, err := FindGitReposParallel(path, runtime.NumCPU())
+	if err != nil {
+		log.Fatalf("Error in finding git repositories: %v", err)
+	}
+
 	if flags.list {
 		urls := getGitRepos(list)
 		if flags.fileName != "" {
@@ -75,68 +83,148 @@ func main() {
 // getDirectories function uses the 'path' argument to get all the directories in the path.
 // It returns a list of directories as a string slice
 func getDirectories(path string) []string {
-	output, err := exec.Command("find", path, "-type", "d", "-name", ".git", "-not", "-path", "*/.git/modules/*").
-		Output()
+	var repos []string
+
+	err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Skip unreadable dirs instead of stopping the walk
+			return fs.SkipDir
+		}
+
+		// Only interested in directories
+		if !d.IsDir() {
+			return nil
+		}
+
+		// If the directory itself is ".git"
+		if d.Name() == ".git" {
+			repoRoot := filepath.Dir(path)
+			repos = append(repos, repoRoot)
+
+			// 🚀 PRUNE: don't walk inside ".git"
+			return fs.SkipDir
+		}
+
+		return nil
+	})
+
 	if err != nil {
-		log.Printf("Error in getting directories: %s", err)
+		log.Fatalf("Error in walking the path %s: %v", path, err)
 	}
-	return strings.Split(string(output), "\n")
+
+	return repos
 }
 
 // getGitRepos function gets the git repositories from the list of directories
-func getGitRepos(list []string) (urls []string) {
-	urls = make([]string, 0, len(list))
-	wg := sync.WaitGroup{}
+func getGitRepos(list []string) []string {
+	urls := make([]string, 0, len(list))
+	var wg sync.WaitGroup
 	wg.Add(len(list))
+
 	for _, dir := range list {
 		go func(dir string) {
 			defer wg.Done()
 			dir = strings.TrimSuffix(dir, "/.git")
-			cmd, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
+
+			output, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 			if err != nil {
-				log.Printf("Error in getting git repo url %s, %s", dir, err)
+				slog.Error("error in getting git repo url for dir", "dir", dir, "error", err)
 				return
 			}
-			urls = append(urls, string(cmd))
+
+			urls = append(urls, string(output))
 		}(dir)
 	}
+
 	wg.Wait()
 	return urls
 }
 
 // pullGitRepos function uses goroutines to run the 'git -C pull --all' command in parallel
 func pullGitRepos(list []string) {
-	wg := sync.WaitGroup{}
+	var wg sync.WaitGroup
 	wg.Add(len(list))
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	failedRepos := make(map[string]error, 0)
+	var mu sync.Mutex
+
 	for _, dir := range list {
 		go func(dir string) {
 			defer wg.Done()
-			if err := runCommand(dir, c); err != nil {
-				log.Print(err)
+			if err := runCommand(dir); err != nil {
+				mu.Lock()
+				failedRepos[dir] = err
+				mu.Unlock()
+				slog.Error("error in pulling git repo for dir", "dir", dir, "error", err)
 			}
 		}(dir)
 	}
-	wg.Wait()
+
+	select {
+	case <-c:
+		slog.Info("Received interrupt signal, terminating...")
+		os.Exit(1)
+	default:
+		wg.Wait()
+	}
+
+	for dir, err := range failedRepos {
+		// try again by rebasing
+		slog.Info("Retrying pull with rebase for dir coz of error", "dir", dir, "error", err)
+		cmd := exec.Command("git", "-C", dir, "pull", "--rebase", "--depth=1")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			slog.Error("error in pulling with rebase for dir", "dir", dir, "error", err)
+		} else {
+			slog.Info("Successfully pulled with rebase for dir", "dir", dir)
+			mu.Lock()
+			delete(failedRepos, dir)
+			mu.Unlock()
+		}
+	}
+
+	// try again for failed repos, try reseting git hard
+	for dir, err := range failedRepos {
+		slog.Info("Retrying pull with reset for dir coz of error", "dir", dir, "error", err)
+		cmd := exec.Command("git", "-C", dir, "reset", "--hard")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			slog.Error("error in resetting git for dir", "dir", dir, "error", err)
+			continue
+		}
+
+		if err := runCommand(dir); err != nil {
+			slog.Error("error in pulling after reset for dir", "dir", dir, "error", err)
+		} else {
+			slog.Info("Successfully pulled after reset for dir", "dir", dir)
+			mu.Lock()
+			delete(failedRepos, dir)
+			mu.Unlock()
+		}
+	}
 }
 
 // runCommand function runs the 'git -C pull --all' command in the directory specified by the 'dir' argument
-func runCommand(dir string, c chan os.Signal) (err error) {
+func runCommand(dir string) error {
 	dir = strings.TrimSuffix(dir, "/.git")
-	cmd := exec.Command("git", "-C", dir, "pull", "--all")
+	cmd := exec.Command("git", "-C", dir, "pull", "--depth=1")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("Error starting pulling process %s, %s", dir, err)
+
+	slog.Info("pulling dir", "dir", dir)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("error pulling %s, %s", dir, err)
 	}
-	select {
-	case <-c:
-		log.Fatal(cmd.Process.Kill())
-	default:
-		err = cmd.Wait()
-	}
-	return err
+
+	slog.Info("pulled dir", "dir", dir)
+	return nil
 }
 
 // parsePath function parses the path argument and returns the path as a string
@@ -146,16 +234,16 @@ func parsePath(path string) string {
 		path, _ = os.Getwd()
 		return path
 	}
+
 	if strings.HasPrefix(path, "~/") {
 		home, _ := os.UserHomeDir()
 		path = strings.Replace(path, "~/", home, 1)
 	}
+
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			log.Fatal("Path does not exists. Please specify a valid path")
-		}
-		log.Fatalf("Error in getting path: %s", err)
+		log.Fatalf("error in accessing path %s: %v", path, err)
 	}
+
 	return path
 }
 
@@ -170,21 +258,34 @@ func printList(list []string) {
 func saveToFile(fileName string, list []string) {
 	file, err := os.Create(fileName)
 	if err != nil {
-		log.Fatalf("Error in creating file: %s", err)
+		log.Fatalf("Error in creating file %s: %v", fileName, err)
 	}
+
 	defer file.Close()
+	var b strings.Builder
 	for _, url := range list {
-		file.WriteString(url)
+		b.WriteString(url)
 	}
+
+	if _, err := file.WriteString(b.String()); err != nil {
+		log.Fatalf("Error in writing to file %s: %v", fileName, err)
+	}
+
+	if err := file.Close(); err != nil {
+		log.Fatalf("Error in closing file %s: %v", fileName, err)
+	}
+
+	slog.Info("Saved git repository list to file", "file", fileName)
 }
 
 // getExportData function gets the data to export to JSON
-func getExportData(dirs []string) (jsonData map[string]string) {
-	jsonData = make(map[string]string, len(dirs))
-	wg := sync.WaitGroup{}
+func getExportData(dirs []string) map[string]string {
+	var mtx sync.Mutex
+	var wg sync.WaitGroup
+
 	wg.Add(len(dirs))
-	mtx := sync.Mutex{}
 	prefix := parsePath(flags.path) + "/"
+	jsonData := make(map[string]string, len(dirs))
 
 	for _, dir := range dirs {
 		go func(dir string) {
@@ -192,6 +293,7 @@ func getExportData(dirs []string) (jsonData map[string]string) {
 			if dir == "" {
 				return
 			}
+
 			data := getGitRepo(dir)
 			dir = strings.TrimPrefix(strings.TrimSuffix(dir, "/.git"), prefix)
 
@@ -208,15 +310,16 @@ func getExportData(dirs []string) (jsonData map[string]string) {
 func getGitRepo(dir string) string {
 	output, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
-		log.Fatalf("Error getting git repo from %s: %s", dir, err)
+		log.Fatalf("Error in getting git repo url for dir %s: %v", dir, err)
 	}
+
 	return strings.TrimSpace(string(output))
 }
 
 // saveFile function saves the data to a file
 func saveFile(filename string, data []byte) {
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		log.Fatalf("Error saving file: %s, %s", filename, err)
+	if err := os.WriteFile(filename, data, 0o644); err != nil {
+		log.Fatalf("Error in writing to file %s: %v", filename, err)
 	}
 }
 
@@ -224,8 +327,9 @@ func saveFile(filename string, data []byte) {
 func exportJSON(data map[string]string) {
 	result, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		log.Fatalf("Error marshalling JSON: %s", err)
+		log.Fatalf("Error in marshalling JSON: %v", err)
 	}
+
 	fileName := flags.fileName
 	if fileName == "" {
 		fileName = "export.json"
@@ -236,18 +340,22 @@ func exportJSON(data map[string]string) {
 }
 
 // importJSON function imports the data from a JSON file
-func importJSON(filename string) (jsonData map[string]string) {
+func importJSON(filename string) map[string]string {
 	if filename == "" {
-		log.Println("No filename specified, using 'export.json'")
+		slog.Warn("Filename not specified. Using 'export.json' as default")
 		filename = "export.json"
 	}
+
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatalf("Error reading file: %s, %s", filename, err)
+		log.Fatalf("Error in reading file %s: %v", filename, err)
 	}
+
+	jsonData := make(map[string]string)
 	if err = json.Unmarshal(data, &jsonData); err != nil {
-		log.Fatalf("Error unmarshalling JSON: %s", err)
+		log.Fatalf("Error in unmarshalling JSON %s: %v", filename, err)
 	}
+
 	return jsonData
 }
 
@@ -263,28 +371,31 @@ func createRepos(data map[string]string) {
 		go func(dir, url string) {
 			defer wg.Done()
 			dir = importPath + dir
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				log.Fatalf("Error creating directory: %s, %s", dir, err)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				log.Fatalf("Error in creating directory %s: %v", dir, err)
 			}
-			clone(dir, url, c)
+			clone(dir, url)
 		}(dir, url)
-
 	}
-	wg.Wait()
+
+	select {
+	case <-c:
+		slog.Info("Received interrupt signal, terminating...")
+		os.Exit(1)
+	default:
+		wg.Wait()
+	}
 }
 
 // clone function clones the git repository
-func clone(dir, url string, c chan os.Signal) {
+func clone(dir, url string) {
 	cmd := exec.Command("git", "clone", url, dir)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("Error starting clone process %s, %s", url, err)
+
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Error in cloning git repo %s: %v", url, err)
 	}
-	select {
-	case <-c:
-		log.Fatal(cmd.Process.Kill())
-	default:
-		cmd.Wait()
-	}
+
+	slog.Info("Cloned git repo", "url", url)
 }
